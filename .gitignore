@@ -1,4 +1,5 @@
 __pycache__/
+.ruff_cache/
 *.py[cod]
 claude-cache-gateway.jsonl
 .DS_Store
