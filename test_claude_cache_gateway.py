@@ -17,20 +17,16 @@ class RepairTests(unittest.TestCase):
                 {"type": "text", "text": "stable", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
             ],
             "messages": [
-                {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "read", "input": {}}]},
                 {
                     "role": "user",
                     "content": [
-                        {"type": "tool_result", "tool_use_id": "t", "content": "private result"},
                         {
                             "type": "text",
-                            "text": gateway.CONTINUATION_PROMPTS.copy().pop(),
+                            "text": "private prompt",
                             "cache_control": {"type": "ephemeral", "ttl": "5m"},
-                        },
+                        }
                     ],
                 },
-                {"role": "assistant", "content": [{"type": "text", "text": gateway.NO_RESPONSE}]},
-                {"role": "user", "content": gateway.CONTINUATION_PROMPTS.copy().pop()},
                 {
                     "role": "system",
                     "content": [
@@ -44,48 +40,60 @@ class RepairTests(unittest.TestCase):
             ],
         }
 
-    def test_observe_is_byte_identical(self):
+    def test_observe_is_byte_identical_and_reports_both_issues(self):
         raw = json.dumps(self.fixture(), indent=2).encode()
         result = gateway.analyze_and_maybe_repair(raw, repair=False)
         self.assertEqual(result.body, raw)
-        self.assertGreaterEqual(len(result.detected), 2)
-        self.assertEqual(result.repairs, [])
+        self.assertEqual(len(result.ordering_issues), 1)
+        self.assertEqual(len(result.tail_issues), 1)
+        self.assertEqual(result.ordering_repairs, [])
+        self.assertEqual(result.tail_repairs, [])
 
-    def test_repair_moves_markers_to_stable_tool_result(self):
+    def test_repair_orders_ttls_and_removes_tail_marker(self):
         raw = gateway.compact_json(self.fixture())
-        before = gateway.ordered_breakpoints(json.loads(raw))
         result = gateway.analyze_and_maybe_repair(raw, repair=True)
         repaired = json.loads(result.body)
-        after = gateway.ordered_breakpoints(repaired)
-        self.assertTrue(any(x["kind"] == "total_tokens_reminder" for x in before))
-        self.assertFalse(any(x["kind"] in {"total_tokens_reminder", "continuation_prompt"} for x in after))
-        tool_result = repaired["messages"][1]["content"][0]
-        self.assertEqual(tool_result["cache_control"]["ttl"], "5m")
+        self.assertEqual(len(result.ordering_repairs), 1)
+        self.assertEqual(len(result.tail_repairs), 1)
+        self.assertEqual(repaired["messages"][0]["content"][0]["cache_control"]["ttl"], "5m")
         self.assertNotIn("cache_control", repaired["messages"][-1]["content"][0])
-        self.assertEqual(len(result.repairs), 2)
+        self.assertEqual(gateway.ttl_order_issues(repaired), [])
 
-    def test_historical_continuation_text_is_not_rewritten(self):
+    def test_tail_marker_moves_to_nearest_ordinary_turn(self):
         body = self.fixture()
-        historical = {
+        del body["messages"][0]["content"][0]["cache_control"]
+        result = gateway.analyze_and_maybe_repair(gateway.compact_json(body), repair=True)
+        repaired = json.loads(result.body)
+        target = repaired["messages"][0]["content"][0]
+        self.assertEqual(target["cache_control"]["ttl"], "1h")
+        self.assertEqual(result.ordering_repairs, [])
+        self.assertEqual(len(result.tail_repairs), 1)
+
+    def test_continuation_content_and_marker_are_not_special_cased(self):
+        body = self.fixture()
+        continuation = {
             "role": "user",
             "content": [
                 {
                     "type": "text",
-                    "text": next(iter(gateway.CONTINUATION_PROMPTS)),
+                    "text": "<tool-result>Tool call complete. Results are above.</tool-result>",
                     "cache_control": {"type": "ephemeral", "ttl": "5m"},
                 }
             ],
         }
-        body["messages"].insert(0, historical)
+        body["messages"].insert(1, continuation)
         result = gateway.analyze_and_maybe_repair(gateway.compact_json(body), repair=True)
         repaired = json.loads(result.body)
-        self.assertIn("cache_control", repaired["messages"][0]["content"][0])
+        block = repaired["messages"][1]["content"][0]
+        self.assertEqual(block["text"], continuation["content"][0]["text"])
+        self.assertEqual(block["cache_control"]["ttl"], "5m")
 
     def test_plain_request_without_bug_is_unchanged(self):
         raw = b'{"model":"m","messages":[{"role":"user","content":"hello"}]}'
         result = gateway.analyze_and_maybe_repair(raw, repair=True)
         self.assertEqual(result.body, raw)
-        self.assertEqual(result.detected, [])
+        self.assertEqual(result.ordering_issues, [])
+        self.assertEqual(result.tail_issues, [])
 
 
 class MemoryLogger:
@@ -121,27 +129,23 @@ class IntegrationTests(unittest.TestCase):
                 self.wfile.write(body)
 
         upstream = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
-        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
-        upstream_thread.start()
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
         logger = MemoryLogger()
         config = gateway.Config(
             upstream=urllib.parse.urlsplit(f"http://127.0.0.1:{upstream.server_port}"),
             mode="repair",
             logger=logger,
-            stats=gateway.RunStats(),
             quiet=True,
             timeout=5,
         )
         proxy = gateway.CacheGatewayServer(("127.0.0.1", 0), config)
-        proxy_thread = threading.Thread(target=proxy.serve_forever, daemon=True)
-        proxy_thread.start()
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
         try:
-            fixture = RepairTests().fixture()
             connection = http.client.HTTPConnection("127.0.0.1", proxy.server_port, timeout=5)
             connection.request(
                 "POST",
                 "/v1/messages",
-                body=gateway.compact_json(fixture),
+                body=gateway.compact_json(RepairTests().fixture()),
                 headers={"Content-Type": "application/json", "Authorization": "Bearer private"},
             )
             response = connection.getresponse()
@@ -154,18 +158,17 @@ class IntegrationTests(unittest.TestCase):
             proxy.server_close()
             upstream.server_close()
         self.assertEqual(observed["authorization"], "Bearer private")
-        self.assertFalse(
-            any(
-                point["kind"] in {"total_tokens_reminder", "continuation_prompt"}
-                for point in gateway.ordered_breakpoints(observed["body"])
-            )
-        )
+        self.assertEqual(gateway.ttl_order_issues(observed["body"]), [])
+        self.assertFalse(any(point["kind"] == "total_tokens_reminder" for point in gateway.ordered_breakpoints(observed["body"])))
         self.assertEqual(len(logger.records), 1)
-        self.assertEqual(logger.records[0]["usage"]["output_tokens"], 7)
-        self.assertEqual(logger.records[0]["usage"]["reasoning_tokens"], 3)
-        serialized_log = json.dumps(logger.records[0])
+        record = logger.records[0]
+        self.assertEqual(record["usage"]["output_tokens"], 7)
+        self.assertEqual(record["usage"]["reasoning_tokens"], 3)
+        self.assertEqual(len(record["ordering_repairs"]), 1)
+        self.assertEqual(len(record["tail_repairs"]), 1)
+        serialized_log = json.dumps(record)
         self.assertNotIn("private", serialized_log)
-        self.assertNotIn("private result", serialized_log)
+        self.assertNotIn("private prompt", serialized_log)
 
 
 class UsageTests(unittest.TestCase):
@@ -179,9 +182,8 @@ class UsageTests(unittest.TestCase):
         observer = gateway.UsageObserver()
         for i in range(0, len(body), 7):
             observer.feed(body[i : i + 7])
-        usage = observer.finish()
         self.assertEqual(
-            usage,
+            observer.finish(),
             {
                 "input_tokens": 2,
                 "output_tokens": 7,

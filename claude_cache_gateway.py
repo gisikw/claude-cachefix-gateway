@@ -2,8 +2,9 @@
 """Dependency-free Claude Code prompt-cache observer and repair proxy.
 
 Point ANTHROPIC_BASE_URL at this process. It forwards credentials and bodies to
-Anthropic unchanged in observe mode. Repair mode moves cache_control markers
-off known request-time synthetic blocks and onto the latest stable content.
+Anthropic unchanged in observe mode. Repair mode normalizes mixed cache TTL
+ordering and moves a marker off a trailing <total_tokens> reminder onto the
+nearest preceding ordinary user/assistant content block.
 
 The JSONL log contains structure and token metrics, never prompts, responses,
 credentials, or full headers.
@@ -30,13 +31,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, BinaryIO
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 DEFAULT_UPSTREAM = "https://api.anthropic.com"
-CONTINUATION_PROMPTS = {
-    "<tool-result>Tool call complete. Results are above.</tool-result>",
-    "Continue from where you left off.",
-}
-NO_RESPONSE = "No response requested."
 HOP_BY_HOP = {
     "connection",
     "keep-alive",
@@ -79,83 +75,15 @@ def is_total_tokens(block: Any) -> bool:
     return text_of(block).startswith("<total_tokens>")
 
 
-def is_continuation(block: Any) -> bool:
-    return text_of(block) in CONTINUATION_PROMPTS
-
-
-def is_no_response(block: Any) -> bool:
-    return text_of(block) == NO_RESPONSE
-
-
-def message_is_exact_text(message: Any, candidates: set[str]) -> bool:
-    if not isinstance(message, dict):
-        return False
-    content = message.get("content")
-    if isinstance(content, str):
-        return content.strip() in candidates
-    blocks = content_blocks(message)
-    return len(blocks) == 1 and text_of(blocks[0]) in candidates
-
-
-def stable_search_end(messages: list[Any], trailing_system_start: int) -> int:
-    """Exclude a known no-op continuation pair immediately before reminders."""
-    end = trailing_system_start
-    if end >= 2:
-        assistant = messages[end - 2]
-        user = messages[end - 1]
-        if (
-            isinstance(assistant, dict)
-            and assistant.get("role") == "assistant"
-            and message_is_exact_text(assistant, {NO_RESPONSE})
-            and isinstance(user, dict)
-            and user.get("role") == "user"
-            and message_is_exact_text(user, CONTINUATION_PROMPTS)
-        ):
-            return end - 2
-    return end
-
-
-def latest_stable_block(messages: list[Any], before: int) -> tuple[dict[str, Any] | None, str | None]:
-    """Find the latest retained content block, ignoring synthetic text tails."""
-    for mi in range(before - 1, -1, -1):
-        message = messages[mi]
-        blocks = content_blocks(message)
-        for bi in range(len(blocks) - 1, -1, -1):
-            block = blocks[bi]
-            if is_total_tokens(block) or is_continuation(block) or is_no_response(block):
-                continue
-            role = message.get("role", "unknown") if isinstance(message, dict) else "unknown"
-            return block, f"messages[{mi}].{role}[{bi}]"
-    return None, None
-
-
-def ordered_breakpoints(body: Any) -> list[dict[str, Any]]:
-    """List cache breakpoints in Anthropic processing order without content."""
+def ordered_cache_blocks(body: Any) -> list[tuple[dict[str, Any], str]]:
+    """Return cache-bearing blocks in Anthropic's tools/system/messages order."""
     if not isinstance(body, dict):
         return []
-    result: list[dict[str, Any]] = []
+    result: list[tuple[dict[str, Any], str]] = []
 
     def add(block: Any, path: str) -> None:
-        if not isinstance(block, dict) or "cache_control" not in block:
-            return
-        control = block.get("cache_control")
-        if not isinstance(control, dict):
-            return
-        kind = "content"
-        if is_total_tokens(block):
-            kind = "total_tokens_reminder"
-        elif is_continuation(block):
-            kind = "continuation_prompt"
-        elif is_no_response(block):
-            kind = "no_response_sentinel"
-        result.append(
-            {
-                "path": path,
-                "kind": kind,
-                "type": block.get("type"),
-                "ttl": control.get("ttl", "5m"),
-            }
-        )
+        if isinstance(block, dict) and isinstance(block.get("cache_control"), dict):
+            result.append((block, path))
 
     for i, tool in enumerate(body.get("tools") or []):
         add(tool, f"tools[{i}]")
@@ -174,12 +102,70 @@ def ordered_breakpoints(body: Any) -> list[dict[str, Any]]:
     return result
 
 
+def ordered_breakpoints(body: Any) -> list[dict[str, Any]]:
+    result = []
+    for block, path in ordered_cache_blocks(body):
+        control = block["cache_control"]
+        result.append(
+            {
+                "path": path,
+                "kind": "total_tokens_reminder" if is_total_tokens(block) else "content",
+                "type": block.get("type"),
+                "ttl": control.get("ttl", "5m"),
+            }
+        )
+    return result
+
+
+def ttl_order_issues(body: Any) -> list[dict[str, Any]]:
+    """Find a 1h breakpoint occurring after a default/explicit 5m breakpoint."""
+    short_seen = False
+    issues = []
+    for _block, path in ordered_cache_blocks(body):
+        control = _block["cache_control"]
+        ttl = control.get("ttl", "5m")
+        if ttl == "1h" and short_seen:
+            issues.append({"path": path, "from": "1h", "to": "5m"})
+        elif ttl in (None, "", "5m"):
+            short_seen = True
+    return issues
+
+
+def normalize_ttl_order(body: Any) -> list[dict[str, Any]]:
+    repairs = []
+    short_seen = False
+    for block, path in ordered_cache_blocks(body):
+        control = block["cache_control"]
+        ttl = control.get("ttl", "5m")
+        if ttl == "1h" and short_seen:
+            control["ttl"] = "5m"
+            repairs.append({"path": path, "from": "1h", "to": "5m"})
+        elif ttl in (None, "", "5m"):
+            short_seen = True
+    return repairs
+
+
+def latest_ordinary_turn_block(messages: list[Any], before: int) -> tuple[dict[str, Any] | None, str | None]:
+    """Find the nearest preceding block in an ordinary user/assistant turn."""
+    for mi in range(before - 1, -1, -1):
+        message = messages[mi]
+        if not isinstance(message, dict) or message.get("role") not in {"user", "assistant"}:
+            continue
+        blocks = content_blocks(message)
+        for bi in range(len(blocks) - 1, -1, -1):
+            role = message["role"]
+            return blocks[bi], f"messages[{mi}].{role}[{bi}]"
+    return None, None
+
+
 @dataclass
 class RepairResult:
     body: bytes
     json_body: dict[str, Any] | None
-    detected: list[dict[str, Any]] = field(default_factory=list)
-    repairs: list[dict[str, Any]] = field(default_factory=list)
+    ordering_issues: list[dict[str, Any]] = field(default_factory=list)
+    ordering_repairs: list[dict[str, Any]] = field(default_factory=list)
+    tail_issues: list[dict[str, Any]] = field(default_factory=list)
+    tail_repairs: list[dict[str, Any]] = field(default_factory=list)
     parse_error: str | None = None
 
 
@@ -191,61 +177,44 @@ def analyze_and_maybe_repair(raw: bytes, repair: bool) -> RepairResult:
     if not isinstance(body, dict):
         return RepairResult(raw, None, parse_error="body_not_object")
 
+    ordering_issues = ttl_order_issues(body)
+    ordering_repairs = normalize_ttl_order(body) if repair else []
+    tail_issues: list[dict[str, Any]] = []
+    tail_repairs: list[dict[str, Any]] = []
+
     messages = body.get("messages")
-    if not isinstance(messages, list):
-        return RepairResult(raw, body)
+    if isinstance(messages, list):
+        trailing_start = len(messages)
+        while trailing_start > 0:
+            message = messages[trailing_start - 1]
+            if not isinstance(message, dict) or message.get("role") != "system":
+                break
+            trailing_start -= 1
+        target, target_path = latest_ordinary_turn_block(messages, trailing_start)
+        for mi in range(trailing_start, len(messages)):
+            message = messages[mi]
+            for bi, block in enumerate(content_blocks(message)):
+                control = block.get("cache_control")
+                if not is_total_tokens(block) or not isinstance(control, dict):
+                    continue
+                event = {
+                    "path": f"messages[{mi}].system[{bi}]",
+                    "ttl": control.get("ttl", "5m"),
+                    "target": target_path,
+                }
+                tail_issues.append(event)
+                if repair and target is not None:
+                    if not isinstance(target.get("cache_control"), dict):
+                        target["cache_control"] = control
+                        action = "moved"
+                    else:
+                        action = "removed_conflicting_marker"
+                    del block["cache_control"]
+                    tail_repairs.append({**event, "action": action})
 
-    detected: list[dict[str, Any]] = []
-    repairs: list[dict[str, Any]] = []
-
-    trailing_start = len(messages)
-    while trailing_start > 0:
-        message = messages[trailing_start - 1]
-        if not isinstance(message, dict) or message.get("role") != "system":
-            break
-        trailing_start -= 1
-
-    stable_end = stable_search_end(messages, trailing_start)
-    target, target_path = latest_stable_block(messages, stable_end)
-
-    candidates: list[tuple[dict[str, Any], str, str]] = []
-    for mi, message in enumerate(messages):
-        if not isinstance(message, dict):
-            continue
-        role = message.get("role", "unknown")
-        for bi, block in enumerate(content_blocks(message)):
-            if "cache_control" not in block or not isinstance(block.get("cache_control"), dict):
-                continue
-            path = f"messages[{mi}].{role}[{bi}]"
-            if is_total_tokens(block) and mi >= trailing_start:
-                candidates.append((block, path, "total_tokens_reminder"))
-            elif is_continuation(block) and mi >= max(0, stable_end - 1):
-                candidates.append((block, path, "continuation_prompt"))
-
-    for block, path, kind in candidates:
-        control = block.get("cache_control")
-        event = {
-            "kind": kind,
-            "path": path,
-            "ttl": control.get("ttl", "5m") if isinstance(control, dict) else None,
-            "target": target_path,
-        }
-        detected.append(event)
-        if not repair or target is None or control is None:
-            continue
-        # Process candidates in message order. A 5m continuation marker usually
-        # arrives before a 1h reminder marker; preserving the first marker also
-        # preserves Anthropic's required non-increasing TTL order.
-        if not isinstance(target.get("cache_control"), dict):
-            target["cache_control"] = control
-            action = "moved"
-        else:
-            action = "removed_conflicting_marker"
-        del block["cache_control"]
-        repairs.append({**event, "action": action})
-
-    output = compact_json(body) if repairs else raw
-    return RepairResult(output, body, detected, repairs)
+    changed = bool(ordering_repairs or tail_repairs)
+    output = compact_json(body) if changed else raw
+    return RepairResult(output, body, ordering_issues, ordering_repairs, tail_issues, tail_repairs)
 
 
 def find_usage(value: Any) -> dict[str, Any] | None:
@@ -324,64 +293,6 @@ class UsageObserver:
                 self.usage[key] = item
 
 
-class RunStats:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self.requests = 0
-        self.successes = 0
-        self.requests_with_unstable_markers = 0
-        self.requests_repaired = 0
-        self.suspected_full_rewrites = 0
-        self.cache_read_tokens = 0
-        self.cache_write_tokens = 0
-        self.output_tokens = 0
-
-    def add(self, record: dict[str, Any]) -> None:
-        usage = record.get("usage") or {}
-        with self._lock:
-            self.requests += 1
-            self.successes += record.get("outcome") == "ok"
-            self.requests_with_unstable_markers += bool(record.get("unstable_breakpoints"))
-            self.requests_repaired += bool(record.get("repairs"))
-            self.suspected_full_rewrites += bool(record.get("suspected_full_cache_rewrite"))
-            for attribute, key in (
-                ("cache_read_tokens", "cache_read_tokens"),
-                ("cache_write_tokens", "cache_write_tokens"),
-                ("output_tokens", "output_tokens"),
-            ):
-                value = usage.get(key)
-                if isinstance(value, int):
-                    setattr(self, attribute, getattr(self, attribute) + value)
-
-    def snapshot(self, mode: str) -> dict[str, Any]:
-        with self._lock:
-            denominator = self.cache_read_tokens + self.cache_write_tokens
-            ratio = self.cache_read_tokens / denominator if denominator else None
-            if self.suspected_full_rewrites >= 2:
-                conclusion = "repeated_full_cache_rewrites_observed"
-            elif self.requests_with_unstable_markers:
-                conclusion = "known_unstable_breakpoints_observed"
-            elif self.successes < 10:
-                conclusion = "insufficient_data"
-            else:
-                conclusion = "no_known_marker_bug_observed"
-            return {
-                "type": "run_summary",
-                "timestamp": utc_now(),
-                "mode": mode,
-                "requests": self.requests,
-                "successes": self.successes,
-                "requests_with_unstable_markers": self.requests_with_unstable_markers,
-                "requests_repaired": self.requests_repaired,
-                "suspected_full_cache_rewrites": self.suspected_full_rewrites,
-                "cache_read_tokens": self.cache_read_tokens,
-                "cache_write_tokens": self.cache_write_tokens,
-                "cache_read_ratio": round(ratio, 4) if ratio is not None else None,
-                "output_tokens": self.output_tokens,
-                "conclusion": conclusion,
-            }
-
-
 class JSONLLogger:
     def __init__(self, path: Path | None) -> None:
         self.path = path
@@ -410,7 +321,6 @@ class Config:
     upstream: urllib.parse.SplitResult
     mode: str
     logger: JSONLLogger
-    stats: RunStats
     quiet: bool
     timeout: float
 
@@ -482,7 +392,7 @@ class CacheGatewayHandler(BaseHTTPRequestHandler):
         result = analyze_and_maybe_repair(raw_body, self.config.mode == "repair")
         before = ordered_breakpoints(original_json)
         outbound_json = result.json_body
-        if result.repairs:
+        if result.ordering_repairs or result.tail_repairs:
             try:
                 outbound_json = json.loads(result.body)
             except json.JSONDecodeError:
@@ -549,11 +459,6 @@ class CacheGatewayHandler(BaseHTTPRequestHandler):
 
         cache_write = usage.get("cache_write_tokens")
         cache_read = usage.get("cache_read_tokens")
-        suspected_full_rewrite = bool(
-            isinstance(cache_write, int)
-            and cache_write >= 50_000
-            and (not isinstance(cache_read, int) or cache_write > max(cache_read * 2, 50_000))
-        )
         record = {
             "timestamp": utc_now(),
             "request_id": request_id,
@@ -566,25 +471,31 @@ class CacheGatewayHandler(BaseHTTPRequestHandler):
             "outbound_bytes": len(result.body),
             "breakpoints_before": before,
             "breakpoints_after": after,
-            "unstable_breakpoints": result.detected,
-            "repairs": result.repairs,
+            "ordering_issues": result.ordering_issues,
+            "ordering_repairs": result.ordering_repairs,
+            "tail_issues": result.tail_issues,
+            "tail_repairs": result.tail_repairs,
             "response_status": status,
             "outcome": outcome,
             "duration_ms": round((time.monotonic() - started) * 1000),
             "usage": usage,
-            "suspected_full_cache_rewrite": suspected_full_rewrite,
             "error": error,
         }
         self.config.logger.write(record)
-        self.config.stats.add(record)
         if not self.config.quiet:
-            action = "repaired" if result.repairs else ("detected" if result.detected else "clean")
             print(
-                f"[cache-gateway] {status or '-'} model={model or '-'} cache={action} "
-                f"read={cache_read if cache_read is not None else '-'} "
-                f"write={cache_write if cache_write is not None else '-'} "
+                f"[cache-gateway] status={status or '-'} model={model or '-'} "
+                f"input={usage.get('input_tokens') if usage.get('input_tokens') is not None else '-'} "
                 f"output={usage.get('output_tokens') if usage.get('output_tokens') is not None else '-'} "
-                f"full_rewrite={'yes' if suspected_full_rewrite else 'no'}",
+                f"cache_read={cache_read if cache_read is not None else '-'} "
+                f"cache_write={cache_write if cache_write is not None else '-'} "
+                f"cache_write_5m={usage.get('cache_write_5m_tokens') if usage.get('cache_write_5m_tokens') is not None else '-'} "
+                f"cache_write_1h={usage.get('cache_write_1h_tokens') if usage.get('cache_write_1h_tokens') is not None else '-'} "
+                f"reasoning={usage.get('reasoning_tokens') if usage.get('reasoning_tokens') is not None else '-'} "
+                f"ordering_needed={int(bool(result.ordering_issues))} "
+                f"ordering_repaired={int(bool(result.ordering_repairs))} "
+                f"tail_needed={int(bool(result.tail_issues))} "
+                f"tail_repaired={int(bool(result.tail_repairs))}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -630,7 +541,7 @@ def outbound_headers(source: Any, upstream: urllib.parse.SplitResult) -> dict[st
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("observe", "repair"), default="observe", help="observe leaves request bodies byte-identical; repair moves known unstable cache markers")
+    parser.add_argument("--mode", choices=("observe", "repair"), default="observe", help="observe leaves request bodies byte-identical; repair orders TTLs and relocates a trailing total_tokens marker")
     parser.add_argument("--listen", default="127.0.0.1", help="listen address (default: loopback only)")
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--upstream", default=DEFAULT_UPSTREAM, help=f"upstream base URL (default: {DEFAULT_UPSTREAM})")
@@ -655,8 +566,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     log_path = None if str(args.log) == "-" else args.log
     logger = JSONLLogger(log_path)
-    stats = RunStats()
-    config = Config(upstream=upstream, mode=args.mode, logger=logger, stats=stats, quiet=args.quiet, timeout=args.timeout)
+    config = Config(upstream=upstream, mode=args.mode, logger=logger, quiet=args.quiet, timeout=args.timeout)
     server = CacheGatewayServer((args.listen, args.port), config)
     actual_host, actual_port = server.server_address[:2]
 
@@ -672,10 +582,7 @@ def main(argv: list[str] | None = None) -> int:
         server.serve_forever(poll_interval=0.25)
     finally:
         server.server_close()
-        summary = stats.snapshot(args.mode)
-        logger.write(summary)
         logger.close()
-        print("[cache-gateway] run summary: " + json.dumps(summary, separators=(",", ":")), file=sys.stderr)
     return 0
 
 

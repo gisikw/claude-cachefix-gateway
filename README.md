@@ -1,124 +1,92 @@
 # Claude Cache Gateway
 
-A single-file, dependency-free pass-through gateway for diagnosing and repairing
-Claude Code prompt-cache invalidation.
+A dependency-free, single-file pass-through gateway for observing and repairing
+Claude Code prompt-cache requests.
 
-It is designed for a coworker to download one Python file, run it locally, and
-point Claude Code at it with `ANTHROPIC_BASE_URL`. The gateway does **not** ask
-for, load, or store credentials. It forwards the authentication headers Claude
-Code already sends to Anthropic.
+It forwards Claude Code's existing credentials and streams Anthropic's response
+back unchanged. It does not load, supply, store, or refresh credentials, and it
+does not log prompts or response text.
 
-## What it detects
+## Precisely what it repairs
 
-Some Claude Code request shapes put `cache_control` on request-time synthetic
-content:
+Only two request properties:
 
-- the trailing role-system `<total_tokens>` reminder;
-- a synthetic continuation prompt such as `Continue from where you left off.`;
-- the equivalent tool-result continuation sentinel.
+1. **TTL ordering.** Anthropic processes cache breakpoints in tools → system →
+   messages order. Once a default/explicit 5-minute breakpoint appears, a later
+   1-hour breakpoint is invalid. Repair mode downgrades the later marker to 5m.
+2. **Trailing reminder marker.** If a trailing role-system `<total_tokens>`
+   reminder owns a cache marker, repair mode moves that marker to the nearest
+   preceding content block in an ordinary user or assistant turn. If that turn
+   already has a marker, the existing marker wins and the trailing marker is
+   removed.
 
-Those blocks can disappear and be regenerated between requests. A cache prefix
-ending on one is then not reusable by the succeeding turn. The observable
-signature is a cache-read count pinned near the fixed system prompt while
-cache-creation grows toward the entire conversation size.
+It does **not** recognize, strip, relocate, or otherwise special-case tool
+continuation messages. It does not perform projection cleanup.
 
-## Requirements
+## Run
 
-- Python 3.10 or newer.
-- No pip packages.
-- macOS, Linux, or Windows with Python installed.
+Requires Python 3.10+ and no pip packages.
 
-Modern macOS does not guarantee a system Python. If `python3 --version` fails,
-install Python with your normal developer tooling, for example:
-
-```sh
-brew install python
-```
-
-## Observe without changing requests
-
-Terminal 1:
+Observe without changing request bodies:
 
 ```sh
 python3 claude_cache_gateway.py --mode observe
 ```
 
-Terminal 2:
-
-```sh
-ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
-```
-
-`observe` mode forwards request bodies byte-for-byte. It logs whether unstable
-breakpoints were present and extracts response usage from both buffered JSON
-and SSE streams.
-
-Claude Code reads `ANTHROPIC_BASE_URL` when it starts. Start a new `claude`
-process after setting the variable.
-
-## Repair known unstable markers
+Repair the two cache conditions above:
 
 ```sh
 python3 claude_cache_gateway.py --mode repair
 ```
 
-Then start Claude Code as above. Repair mode moves unstable cache markers onto
-the latest stable real content block. It does not remove prompts, tool results,
-messages, thinking signatures, or credentials.
+Then start a new Claude Code process in another terminal:
 
-Start in `observe`, reproduce the behavior, then repeat in `repair` for an A/B
-comparison.
-
-## What is logged
-
-The default log is `claude-cache-gateway.jsonl`, created mode 0600. Each line
-contains:
-
-- timestamp and random request ID;
-- model, API path, response status, outcome, and latency;
-- a one-way hash of the Claude Code session ID when present;
-- cache breakpoint paths, kinds, and TTLs before and after repair;
-- input, output, cache-read, cache-write, and reasoning token counts when the
-  upstream reports them;
-- 5-minute versus 1-hour cache creation when reported;
-- a conservative `suspected_full_cache_rewrite` flag.
-
-It deliberately does **not** log:
-
-- prompts or response text;
-- tool inputs or tool results;
-- request or response bodies;
-- authorization, API-key, cookie, or full header values;
-- raw session IDs.
-
-Disable the file log with `--log -`. One-line summaries still appear on stderr
-unless `--quiet` is supplied. When the gateway stops, it emits a cumulative run
-summary and appends it to the JSONL log. Its conclusion is one of
-`insufficient_data`, `known_unstable_breakpoints_observed`,
-`repeated_full_cache_rewrites_observed`, or `no_known_marker_bug_observed`.
-
-Example request summary:
-
-```text
-[cache-gateway] 200 model=claude-opus-5 cache=detected read=15119 write=199545 output=358 full_rewrite=yes
+```sh
+ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
 ```
 
-## Recommended validation protocol
+Claude Code reads `ANTHROPIC_BASE_URL` at process startup.
 
-1. Start the gateway in `observe` mode.
-2. Start a fresh Claude Code process through it.
-3. Work normally for at least 20 requests in one non-compacted session. Cold
-   starts alone are not evidence of a cache bug.
-4. Include several tool turns and, if safe, one resume/continuation.
-5. Keep request spacing below five minutes while testing so normal 5-minute
-   expiry is not confused with invalidation.
-6. Stop Claude Code and the gateway.
-7. Repeat the same general workload in `repair` mode.
-8. Compare cache-read/cache-write trajectories, not output length alone.
+Modern macOS does not guarantee Python is installed. If `python3 --version`
+fails, use the team's normal Python setup or, with Homebrew:
 
-A healthy long session should generally read an increasingly large retained
-prefix and write only the new tail. A suspicious session repeatedly writes most
-of its growing context while reading only a small fixed prefix.
+```sh
+brew install python
+```
+
+## Per-request output
+
+The gateway waits for Anthropic's response usage event and prints one line per
+request:
+
+```text
+[cache-gateway] status=200 model=claude-opus-5 input=2 output=358 cache_read=194749 cache_write=19529 cache_write_5m=0 cache_write_1h=19529 reasoning=41 ordering_needed=1 ordering_repaired=1 tail_needed=1 tail_repaired=1
+```
+
+Fields unavailable from the upstream are printed as `-`.
+
+- `ordering_needed`: the incoming request had invalid TTL ordering.
+- `ordering_repaired`: repair mode changed at least one late 1h marker to 5m.
+- `tail_needed`: a trailing `<total_tokens>` marker was present.
+- `tail_repaired`: repair mode moved or removed that marker.
+
+In observe mode, `*_needed` can be 1 while `*_repaired` remains 0.
+
+There is no Ctrl-C aggregate report.
+
+## JSONL log
+
+The same request-level information is written to
+`claude-cache-gateway.jsonl`, mode 0600. It includes structural breakpoint paths,
+TTL changes, usage, status, and latency. It does not include:
+
+- prompts or response text;
+- tool inputs or results;
+- request or response bodies;
+- credentials, cookies, or complete headers;
+- raw Claude Code session IDs.
+
+Disable the file with `--log -`. Suppress terminal lines with `--quiet`.
 
 ## Options
 
@@ -132,9 +100,9 @@ of its growing context while reading only a small fixed prefix.
 --timeout 900
 ```
 
-The listener is loopback-only by default. A non-loopback listener is refused
-unless `--allow-remote` is explicit. HTTPS upstreams are required unless
-`--allow-insecure-upstream` is supplied for local testing.
+The listener is loopback-only unless `--allow-remote` is explicit. HTTPS
+upstreams are required unless `--allow-insecure-upstream` is supplied for local
+testing.
 
 Health check:
 
@@ -148,15 +116,5 @@ curl http://127.0.0.1:8787/_cache_gateway/health
 python3 -m unittest -v
 ```
 
-The distributable runtime remains the single file
-`claude_cache_gateway.py`; the README and test file are project support.
-
-## Scope and caveats
-
-This is a narrow diagnostic proxy, not a general production gateway. It
-supports ordinary Claude Code HTTP/1.1 Messages API traffic, including SSE. It
-forwards credentials but never terminates or refreshes authentication itself.
-
-Anthropic does not publish the exact subscription quota weighting formula.
-Cache token telemetry can prove cache behavior; it cannot by itself prove the
-precise amount charged against a Pro or Max allowance.
+The runtime distribution is the single file `claude_cache_gateway.py`; the
+README and tests are support material. MIT licensed.
