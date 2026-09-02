@@ -92,9 +92,12 @@ It deliberately does **not** log:
 - raw session IDs.
 
 Disable the file log with `--log -`. One-line summaries still appear on stderr
-unless `--quiet` is supplied.
+unless `--quiet` is supplied. When the gateway stops, it emits a cumulative run
+summary and appends it to the JSONL log. Its conclusion is one of
+`insufficient_data`, `known_unstable_breakpoints_observed`,
+`repeated_full_cache_rewrites_observed`, or `no_known_marker_bug_observed`.
 
-Example summary:
+Example request summary:
 
 ```text
 [cache-gateway] 200 model=claude-opus-5 cache=detected read=15119 write=199545 output=358 full_rewrite=yes

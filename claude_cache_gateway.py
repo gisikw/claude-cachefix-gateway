@@ -324,6 +324,64 @@ class UsageObserver:
                 self.usage[key] = item
 
 
+class RunStats:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.requests = 0
+        self.successes = 0
+        self.requests_with_unstable_markers = 0
+        self.requests_repaired = 0
+        self.suspected_full_rewrites = 0
+        self.cache_read_tokens = 0
+        self.cache_write_tokens = 0
+        self.output_tokens = 0
+
+    def add(self, record: dict[str, Any]) -> None:
+        usage = record.get("usage") or {}
+        with self._lock:
+            self.requests += 1
+            self.successes += record.get("outcome") == "ok"
+            self.requests_with_unstable_markers += bool(record.get("unstable_breakpoints"))
+            self.requests_repaired += bool(record.get("repairs"))
+            self.suspected_full_rewrites += bool(record.get("suspected_full_cache_rewrite"))
+            for attribute, key in (
+                ("cache_read_tokens", "cache_read_tokens"),
+                ("cache_write_tokens", "cache_write_tokens"),
+                ("output_tokens", "output_tokens"),
+            ):
+                value = usage.get(key)
+                if isinstance(value, int):
+                    setattr(self, attribute, getattr(self, attribute) + value)
+
+    def snapshot(self, mode: str) -> dict[str, Any]:
+        with self._lock:
+            denominator = self.cache_read_tokens + self.cache_write_tokens
+            ratio = self.cache_read_tokens / denominator if denominator else None
+            if self.suspected_full_rewrites >= 2:
+                conclusion = "repeated_full_cache_rewrites_observed"
+            elif self.requests_with_unstable_markers:
+                conclusion = "known_unstable_breakpoints_observed"
+            elif self.successes < 10:
+                conclusion = "insufficient_data"
+            else:
+                conclusion = "no_known_marker_bug_observed"
+            return {
+                "type": "run_summary",
+                "timestamp": utc_now(),
+                "mode": mode,
+                "requests": self.requests,
+                "successes": self.successes,
+                "requests_with_unstable_markers": self.requests_with_unstable_markers,
+                "requests_repaired": self.requests_repaired,
+                "suspected_full_cache_rewrites": self.suspected_full_rewrites,
+                "cache_read_tokens": self.cache_read_tokens,
+                "cache_write_tokens": self.cache_write_tokens,
+                "cache_read_ratio": round(ratio, 4) if ratio is not None else None,
+                "output_tokens": self.output_tokens,
+                "conclusion": conclusion,
+            }
+
+
 class JSONLLogger:
     def __init__(self, path: Path | None) -> None:
         self.path = path
@@ -352,6 +410,7 @@ class Config:
     upstream: urllib.parse.SplitResult
     mode: str
     logger: JSONLLogger
+    stats: RunStats
     quiet: bool
     timeout: float
 
@@ -517,6 +576,7 @@ class CacheGatewayHandler(BaseHTTPRequestHandler):
             "error": error,
         }
         self.config.logger.write(record)
+        self.config.stats.add(record)
         if not self.config.quiet:
             action = "repaired" if result.repairs else ("detected" if result.detected else "clean")
             print(
@@ -595,7 +655,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     log_path = None if str(args.log) == "-" else args.log
     logger = JSONLLogger(log_path)
-    config = Config(upstream=upstream, mode=args.mode, logger=logger, quiet=args.quiet, timeout=args.timeout)
+    stats = RunStats()
+    config = Config(upstream=upstream, mode=args.mode, logger=logger, stats=stats, quiet=args.quiet, timeout=args.timeout)
     server = CacheGatewayServer((args.listen, args.port), config)
     actual_host, actual_port = server.server_address[:2]
 
@@ -611,7 +672,10 @@ def main(argv: list[str] | None = None) -> int:
         server.serve_forever(poll_interval=0.25)
     finally:
         server.server_close()
+        summary = stats.snapshot(args.mode)
+        logger.write(summary)
         logger.close()
+        print("[cache-gateway] run summary: " + json.dumps(summary, separators=(",", ":")), file=sys.stderr)
     return 0
 
 

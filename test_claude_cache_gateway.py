@@ -128,6 +128,7 @@ class IntegrationTests(unittest.TestCase):
             upstream=urllib.parse.urlsplit(f"http://127.0.0.1:{upstream.server_port}"),
             mode="repair",
             logger=logger,
+            stats=gateway.RunStats(),
             quiet=True,
             timeout=5,
         )
