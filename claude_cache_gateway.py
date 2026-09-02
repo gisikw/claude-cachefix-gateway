@@ -25,13 +25,14 @@ import time
 import traceback
 import urllib.parse
 import uuid
+import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, BinaryIO
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 DEFAULT_UPSTREAM = "https://api.anthropic.com"
 HOP_BY_HOP = {
     "connection",
@@ -230,15 +231,32 @@ def find_usage(value: Any) -> dict[str, Any] | None:
 
 
 class UsageObserver:
-    """Incrementally extracts usage from SSE or a bounded JSON response."""
+    """Incrementally extracts usage from compressed SSE or bounded JSON."""
 
-    def __init__(self) -> None:
+    def __init__(self, content_encoding: str = "") -> None:
         self._line = bytearray()
         self._body = bytearray()
         self.usage: dict[str, Any] = {}
         self.cache_creation: dict[str, Any] = {}
+        encoding = content_encoding.strip().lower()
+        self._decoder: zlib.Decompress | None = None
+        if encoding in {"gzip", "x-gzip"}:
+            self._decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        elif encoding == "deflate":
+            self._decoder = zlib.decompressobj()
 
     def feed(self, chunk: bytes) -> None:
+        if self._decoder is not None:
+            try:
+                chunk = self._decoder.decompress(chunk)
+            except zlib.error:
+                # Telemetry is observational: decoding failure must never
+                # interrupt forwarding the original response to Claude Code.
+                self._decoder = None
+                return
+        self._feed_decoded(chunk)
+
+    def _feed_decoded(self, chunk: bytes) -> None:
         if len(self._body) < MAX_USAGE_BUFFER:
             room = MAX_USAGE_BUFFER - len(self._body)
             self._body.extend(chunk[:room])
@@ -257,6 +275,11 @@ class UsageObserver:
                     self._observe_json(data)
 
     def finish(self) -> dict[str, Any]:
+        if self._decoder is not None:
+            try:
+                self._feed_decoded(self._decoder.flush())
+            except zlib.error:
+                pass
         self._observe_json(bytes(self._body))
         details = self.usage.get("output_tokens_details")
         reasoning = None
@@ -422,7 +445,7 @@ class CacheGatewayHandler(BaseHTTPRequestHandler):
             sent_headers = True
             self.close_connection = True
 
-            observer = UsageObserver()
+            observer = UsageObserver(upstream_response.getheader("Content-Encoding", ""))
             while True:
                 chunk = upstream_response.read(64 * 1024)
                 if not chunk:
@@ -535,6 +558,10 @@ def outbound_headers(source: Any, upstream: urllib.parse.SplitResult) -> dict[st
     if upstream.port and upstream.port != default_port:
         host += f":{upstream.port}"
     headers["Host"] = host
+    # Claude Code advertises brotli and zstd in addition to standard-library
+    # encodings. Request gzip so the response remains compressed and can also
+    # be inspected without adding third-party dependencies.
+    headers["Accept-Encoding"] = "gzip"
     headers["Via"] = f"1.1 claude-cache-gateway/{VERSION}"
     return headers
 

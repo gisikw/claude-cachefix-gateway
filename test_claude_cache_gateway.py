@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import gzip
 import http.client
 import json
 import threading
@@ -115,15 +116,19 @@ class IntegrationTests(unittest.TestCase):
             def do_POST(self):  # noqa: N802
                 length = int(self.headers["Content-Length"])
                 observed["authorization"] = self.headers.get("Authorization")
+                observed["accept_encoding"] = self.headers.get("Accept-Encoding")
                 observed["body"] = json.loads(self.rfile.read(length))
-                body = (
+                body = gzip.compress(
+                    (
                     b'event: message_start\n'
                     b'data: {"type":"message_start","message":{"usage":{"input_tokens":2,"output_tokens":1,"cache_read_input_tokens":10,"cache_creation_input_tokens":20}}}\n\n'
                     b'event: message_delta\n'
                     b'data: {"type":"message_delta","usage":{"output_tokens":7,"output_tokens_details":{"thinking_tokens":3}}}\n\n'
+                    )
                 )
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Encoding", "gzip")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -158,6 +163,7 @@ class IntegrationTests(unittest.TestCase):
             proxy.server_close()
             upstream.server_close()
         self.assertEqual(observed["authorization"], "Bearer private")
+        self.assertEqual(observed["accept_encoding"], "gzip")
         self.assertEqual(gateway.ttl_order_issues(observed["body"]), [])
         self.assertFalse(any(point["kind"] == "total_tokens_reminder" for point in gateway.ordered_breakpoints(observed["body"])))
         self.assertEqual(len(logger.records), 1)
@@ -182,18 +188,22 @@ class UsageTests(unittest.TestCase):
         observer = gateway.UsageObserver()
         for i in range(0, len(body), 7):
             observer.feed(body[i : i + 7])
-        self.assertEqual(
-            observer.finish(),
-            {
-                "input_tokens": 2,
-                "output_tokens": 7,
-                "cache_read_tokens": 10,
-                "cache_write_tokens": 20,
-                "cache_write_5m_tokens": 4,
-                "cache_write_1h_tokens": 16,
-                "reasoning_tokens": 3,
-            },
-        )
+        expected = {
+            "input_tokens": 2,
+            "output_tokens": 7,
+            "cache_read_tokens": 10,
+            "cache_write_tokens": 20,
+            "cache_write_5m_tokens": 4,
+            "cache_write_1h_tokens": 16,
+            "reasoning_tokens": 3,
+        }
+        self.assertEqual(observer.finish(), expected)
+
+        compressed = gzip.compress(body)
+        observer = gateway.UsageObserver("gzip")
+        for i in range(0, len(compressed), 7):
+            observer.feed(compressed[i : i + 7])
+        self.assertEqual(observer.finish(), expected)
 
 
 if __name__ == "__main__":
